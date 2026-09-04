@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/images/nomia-banner.png" alt="NOMIA - Your Local Intelligence Layer" width="100%">
+</p>
+
 # 🌍 NOMIA
 
 ### Your Local Intelligence Layer
@@ -236,6 +240,7 @@ NOMIA/
 │
 ├── assets/
 │   ├── images/
+│   │   └── nomia-banner.png
 │   └── icons/
 │
 ├── .github/
@@ -252,7 +257,7 @@ NOMIA/
 ## 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/NOMIA.git
+git clone https://github.com/palashgoyalatwork/NOMIA.git
 cd NOMIA
 ```
 
