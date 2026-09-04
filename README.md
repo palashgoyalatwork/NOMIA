@@ -8,6 +8,13 @@
 
 > **Know the city before you explore it.**
 
+<p align="center">
+  <a href="https://github.com/palashgoyalatwork/NOMIA">GitHub Repository</a>
+  &nbsp;•&nbsp;
+  <a href="https://nomia-travel.streamlit.app/">Live Demo</a>
+</p>
+
+
 NOMIA is an international travel and city-intelligence platform designed to help people understand a new city before they start exploring it.
 
 Instead of trying to be another maps application, NOMIA focuses on the practical information travelers actually need after arriving somewhere:
@@ -150,6 +157,24 @@ This layer uses geographic data rather than manually hardcoding large lists of i
 
 ---
 
+## 📸 Product Screenshots
+
+All screenshots below show the same destination — **Rome, Italy** — to demonstrate a complete city-intelligence journey through NOMIA.
+
+| Home | Explore |
+|---|---|
+| ![NOMIA Home](assets/images/screenshots/home-rome.jpeg) | ![NOMIA Explore](assets/images/screenshots/explore-rome.jpeg) |
+
+| Move | Eat |
+|---|---|
+| ![NOMIA Move](assets/images/screenshots/move-rome.jpeg) | ![NOMIA Eat](assets/images/screenshots/eat-rome.jpeg) |
+
+| Shop | Essentials |
+|---|---|
+| ![NOMIA Shop](assets/images/screenshots/shop-rome.jpeg) | ![NOMIA Essentials](assets/images/screenshots/essentials-rome.jpeg) |
+
+---
+
 ## 🗺️ Maps
 
 NOMIA uses **OpenStreetMap**-based geographic information for mapping and location discovery.
@@ -240,7 +265,14 @@ NOMIA/
 │
 ├── assets/
 │   ├── images/
-│   │   └── nomia-banner.png
+│   │   ├── nomia-banner.png
+│   │   └── screenshots/
+│   │       ├── home-rome.jpeg
+│   │       ├── explore-rome.jpeg
+│   │       ├── move-rome.jpeg
+│   │       ├── eat-rome.jpeg
+│   │       ├── shop-rome.jpeg
+│   │       └── essentials-rome.jpeg
 │   └── icons/
 │
 ├── .github/
