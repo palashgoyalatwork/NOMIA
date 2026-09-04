@@ -1,6 +1,8 @@
-import streamlit as st
-import requests
+import time
 from urllib.parse import quote_plus
+
+import requests
+import streamlit as st
 
 from data.cities.catalog import get_city
 
@@ -9,13 +11,33 @@ from data.cities.catalog import get_city
 # CONFIG
 # =========================================================
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Multiple public Overpass instances.
+# If one is unavailable/overloaded, NOMIA automatically tries
+# the next one.
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
 
-# Search radius around the city centre.
+# Primary search radius around the city centre.
 SEARCH_RADIUS = 8000
+
+# Fallback radius if the first successful query returns no
+# useful named locations.
+FALLBACK_RADIUS = 12000
 
 # Maximum locations displayed per category.
 MAX_RESULTS = 5
+
+# Request timeout for each Overpass server.
+REQUEST_TIMEOUT = 75
+
+# Number of retries for temporary server errors.
+MAX_RETRIES = 2
+
+# Short pause between retries.
+RETRY_DELAY = 2
 
 
 # =========================================================
@@ -27,22 +49,27 @@ CATEGORIES = {
         "icon": "🏥",
         "description": "Hospitals and medical facilities",
     },
+
     "Pharmacies": {
         "icon": "💊",
         "description": "Pharmacies and healthcare access",
     },
+
     "ATMs & Banking": {
         "icon": "🏧",
         "description": "ATMs and cash access",
     },
+
     "Transport": {
         "icon": "🚉",
         "description": "Major public transport connections",
     },
+
     "Connectivity": {
         "icon": "📶",
         "description": "Mobile phone and connectivity stores",
     },
+
     "Everyday stores": {
         "icon": "🏪",
         "description": "Convenience stores and everyday shopping",
@@ -179,39 +206,43 @@ LOCAL_TIPS = {
 
 
 # =========================================================
-# OSM TAG MAPPING
+# OSM QUERY
 # =========================================================
 
-OVERPASS_FILTERS = {
-    "Hospitals": """
-        nwr["amenity"="hospital"](around:{radius},{lat},{lon});
-    """,
+def build_overpass_query(lat, lon, radius):
+    """
+    Build one combined Overpass query for all NOMIA
+    essentials categories.
 
-    "Pharmacies": """
-        nwr["amenity"="pharmacy"](around:{radius},{lat},{lon});
-    """,
+    nwr = nodes + ways + relations.
+    out center gives ways/relations a representative
+    coordinate.
+    """
 
-    "ATMs & Banking": """
-        nwr["amenity"="atm"](around:{radius},{lat},{lon});
-        nwr["amenity"="bank"](around:{radius},{lat},{lon});
-    """,
+    return f"""
+[out:json][timeout:60];
 
-    "Transport": """
-        nwr["railway"="station"](around:{radius},{lat},{lon});
-        nwr["railway"="halt"](around:{radius},{lat},{lon});
-        nwr["amenity"="bus_station"](around:{radius},{lat},{lon});
-    """,
+(
+    nwr["amenity"="hospital"](around:{radius},{lat},{lon});
 
-    "Connectivity": """
-        nwr["shop"="mobile_phone"](around:{radius},{lat},{lon});
-        nwr["shop"="electronics"]["name"](around:{radius},{lat},{lon});
-    """,
+    nwr["amenity"="pharmacy"](around:{radius},{lat},{lon});
 
-    "Everyday stores": """
-        nwr["shop"="convenience"](around:{radius},{lat},{lon});
-        nwr["shop"="supermarket"](around:{radius},{lat},{lon});
-    """,
-}
+    nwr["amenity"="atm"](around:{radius},{lat},{lon});
+    nwr["amenity"="bank"](around:{radius},{lat},{lon});
+
+    nwr["railway"="station"](around:{radius},{lat},{lon});
+    nwr["railway"="halt"](around:{radius},{lat},{lon});
+    nwr["amenity"="bus_station"](around:{radius},{lat},{lon});
+
+    nwr["shop"="mobile_phone"](around:{radius},{lat},{lon});
+    nwr["shop"="electronics"]["name"](around:{radius},{lat},{lon});
+
+    nwr["shop"="convenience"](around:{radius},{lat},{lon});
+    nwr["shop"="supermarket"](around:{radius},{lat},{lon});
+);
+
+out center tags;
+"""
 
 
 # =========================================================
@@ -234,11 +265,13 @@ def build_address(tags, city):
 
     if housenumber and street:
         parts.append(f"{housenumber} {street}")
+
     elif street:
         parts.append(street)
 
     if suburb:
         parts.append(suburb)
+
     elif district:
         parts.append(district)
 
@@ -248,7 +281,6 @@ def build_address(tags, city):
     if parts:
         return ", ".join(parts)
 
-    # Some OSM objects have a descriptive locality instead.
     locality = (
         tags.get("addr:place")
         or tags.get("place")
@@ -267,7 +299,7 @@ def build_address(tags, city):
 
 def get_element_coordinates(element):
     """
-    Extract coordinates from OSM node / way / relation.
+    Extract coordinates from an OSM node / way / relation.
     """
 
     if element.get("type") == "node":
@@ -285,68 +317,84 @@ def get_element_coordinates(element):
 
 
 # =========================================================
-# FETCH REAL OSM LOCATIONS
+# CATEGORY CLASSIFICATION
 # =========================================================
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_essential_locations(city, lat, lon):
+def classify_element(tags):
     """
-    Fetch real-world essential locations around the city
-    using OpenStreetMap Overpass.
-
-    Results are cached for 24 hours.
+    Convert raw OSM tags into one NOMIA category.
     """
 
-    query_parts = []
+    amenity = tags.get("amenity")
+    railway = tags.get("railway")
+    shop = tags.get("shop")
 
-    for category, filter_block in OVERPASS_FILTERS.items():
+    name = tags.get("name", "")
+    name_lower = name.lower()
 
-        formatted = filter_block.format(
-            radius=SEARCH_RADIUS,
-            lat=lat,
-            lon=lon,
-        )
+    # -----------------------------------------------------
+    # HOSPITAL
+    # -----------------------------------------------------
 
-        query_parts.append(
-            f"""
-            (
-                {formatted}
-            );
-            """
-        )
+    if amenity == "hospital":
+        return "Hospitals"
 
-    query = f"""
-    [out:json][timeout:35];
+    # -----------------------------------------------------
+    # PHARMACY
+    # -----------------------------------------------------
 
-    (
-        {''.join(query_parts)}
-    );
+    if amenity == "pharmacy":
+        return "Pharmacies"
 
-    out center tags;
+    # -----------------------------------------------------
+    # ATM / BANK
+    # -----------------------------------------------------
+
+    if amenity in {"atm", "bank"}:
+        return "ATMs & Banking"
+
+    # -----------------------------------------------------
+    # TRANSPORT
+    # -----------------------------------------------------
+
+    if (
+        railway in {"station", "halt"}
+        or amenity == "bus_station"
+    ):
+        return "Transport"
+
+    # -----------------------------------------------------
+    # CONNECTIVITY
+    # -----------------------------------------------------
+
+    if shop == "mobile_phone":
+        return "Connectivity"
+
+    if shop == "electronics" and (
+        "mobile" in name_lower
+        or "phone" in name_lower
+        or "telecom" in name_lower
+    ):
+        return "Connectivity"
+
+    # -----------------------------------------------------
+    # EVERYDAY STORES
+    # -----------------------------------------------------
+
+    if shop in {"convenience", "supermarket"}:
+        return "Everyday stores"
+
+    return None
+
+
+# =========================================================
+# PROCESS OSM RESPONSE
+# =========================================================
+
+def process_osm_payload(payload, city):
     """
-
-    headers = {
-        "User-Agent": "NOMIA-Travel-Intelligence/1.0"
-    }
-
-    try:
-
-        response = requests.post(
-            OVERPASS_URL,
-            data=query,
-            headers=headers,
-            timeout=45,
-        )
-
-        response.raise_for_status()
-
-        payload = response.json()
-
-    except Exception:
-        return {
-            category: []
-            for category in CATEGORIES
-        }
+    Convert raw Overpass JSON into NOMIA's category structure.
+    """
 
     elements = payload.get("elements", [])
 
@@ -366,6 +414,7 @@ def fetch_essential_locations(city, lat, lon):
 
         name = tags.get("name")
 
+        # We only show named locations.
         if not name:
             continue
 
@@ -374,73 +423,24 @@ def fetch_essential_locations(city, lat, lon):
         if lat_value is None or lon_value is None:
             continue
 
-        name_lower = name.lower()
+        category = classify_element(tags)
 
-        # -------------------------------------------------
-        # HOSPITAL
-        # -------------------------------------------------
-
-        if tags.get("amenity") == "hospital":
-
-            category = "Hospitals"
-
-        # -------------------------------------------------
-        # PHARMACY
-        # -------------------------------------------------
-
-        elif tags.get("amenity") == "pharmacy":
-
-            category = "Pharmacies"
-
-        # -------------------------------------------------
-        # ATM / BANK
-        # -------------------------------------------------
-
-        elif tags.get("amenity") in {"atm", "bank"}:
-
-            category = "ATMs & Banking"
-
-        # -------------------------------------------------
-        # TRANSPORT
-        # -------------------------------------------------
-
-        elif (
-            tags.get("railway") in {"station", "halt"}
-            or tags.get("amenity") == "bus_station"
-        ):
-
-            category = "Transport"
-
-        # -------------------------------------------------
-        # CONNECTIVITY
-        # -------------------------------------------------
-
-        elif (
-            tags.get("shop") == "mobile_phone"
-            or (
-                tags.get("shop") == "electronics"
-                and "mobile" in name_lower
-            )
-        ):
-
-            category = "Connectivity"
-
-        # -------------------------------------------------
-        # EVERYDAY STORES
-        # -------------------------------------------------
-
-        elif tags.get("shop") in {"convenience", "supermarket"}:
-
-            category = "Everyday stores"
-
-        else:
+        if category is None:
             continue
+
+        try:
+            lat_value = float(lat_value)
+            lon_value = float(lon_value)
+        except (TypeError, ValueError):
+            continue
+
+        name_lower = name.strip().lower()
 
         unique_key = (
             category,
             name_lower,
-            round(float(lat_value), 5),
-            round(float(lon_value), 5),
+            round(lat_value, 5),
+            round(lon_value, 5),
         )
 
         if unique_key in seen[category]:
@@ -450,23 +450,242 @@ def fetch_essential_locations(city, lat, lon):
 
         address = build_address(tags, city)
 
-        results[category].append({
-            "name": name,
-            "address": address,
-            "lat": float(lat_value),
-            "lon": float(lon_value),
-            "type": tags.get("amenity") or tags.get("shop") or tags.get("railway", ""),
-        })
+        results[category].append(
+            {
+                "name": name.strip(),
+                "address": address,
+                "lat": lat_value,
+                "lon": lon_value,
+                "type": (
+                    tags.get("amenity")
+                    or tags.get("shop")
+                    or tags.get("railway")
+                    or ""
+                ),
+            }
+        )
 
     # -----------------------------------------------------
-    # Limit results
+    # Limit results per category
     # -----------------------------------------------------
 
     for category in results:
 
+        # Sort alphabetically for stable presentation.
+        results[category].sort(
+            key=lambda item: item["name"].lower()
+        )
+
         results[category] = results[category][:MAX_RESULTS]
 
     return results
+
+
+# =========================================================
+# SINGLE OVERPASS REQUEST
+# =========================================================
+
+def request_overpass(url, query):
+    """
+    Perform one Overpass request with retry handling.
+    """
+
+    headers = {
+        "User-Agent": (
+            "NOMIA-Travel-Intelligence/1.0 "
+            "(OpenStreetMap data consumer)"
+        ),
+        "Accept": "application/json",
+    }
+
+    last_error = None
+
+    for attempt in range(MAX_RETRIES + 1):
+
+        try:
+
+            response = requests.post(
+                url,
+                data={"data": query},
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            # Temporary / rate-limit server errors.
+            if response.status_code in {
+                429,
+                502,
+                503,
+                504,
+            }:
+
+                last_error = RuntimeError(
+                    f"HTTP {response.status_code}"
+                )
+
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY)
+                    continue
+
+                raise last_error
+
+            response.raise_for_status()
+
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    "Overpass returned an unexpected response."
+                )
+
+            return payload
+
+        except requests.RequestException as exc:
+
+            last_error = exc
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+                continue
+
+            raise
+
+        except ValueError as exc:
+
+            last_error = exc
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+                continue
+
+            raise
+
+    raise RuntimeError(
+        f"Overpass request failed: {last_error}"
+    )
+
+
+# =========================================================
+# FETCH FROM MULTIPLE OVERPASS SERVERS
+# =========================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_essential_locations(city, lat, lon):
+    """
+    Fetch real-world essential locations around the city
+    using OpenStreetMap Overpass.
+
+    Important:
+    Exceptions are raised if every endpoint fails.
+    This prevents a temporary API outage from being cached
+    as an empty result for 24 hours.
+    """
+
+    errors = []
+
+    # -----------------------------------------------------
+    # PASS 1
+    # Primary radius
+    # -----------------------------------------------------
+
+    query = build_overpass_query(
+        lat=lat,
+        lon=lon,
+        radius=SEARCH_RADIUS,
+    )
+
+    for endpoint in OVERPASS_URLS:
+
+        try:
+
+            payload = request_overpass(
+                endpoint,
+                query,
+            )
+
+            results = process_osm_payload(
+                payload,
+                city,
+            )
+
+            total = sum(
+                len(items)
+                for items in results.values()
+            )
+
+            # A successful response with useful locations.
+            if total > 0:
+                return results
+
+            # Successful API response but no useful named
+            # locations. Try a wider radius next.
+            errors.append(
+                f"{endpoint}: response contained no named locations"
+            )
+
+        except Exception as exc:
+
+            errors.append(
+                f"{endpoint}: {str(exc)}"
+            )
+
+    # -----------------------------------------------------
+    # PASS 2
+    # Wider radius
+    # -----------------------------------------------------
+
+    fallback_query = build_overpass_query(
+        lat=lat,
+        lon=lon,
+        radius=FALLBACK_RADIUS,
+    )
+
+    for endpoint in OVERPASS_URLS:
+
+        try:
+
+            payload = request_overpass(
+                endpoint,
+                fallback_query,
+            )
+
+            results = process_osm_payload(
+                payload,
+                city,
+            )
+
+            total = sum(
+                len(items)
+                for items in results.values()
+            )
+
+            if total > 0:
+                return results
+
+            errors.append(
+                f"{endpoint}: wider search also returned no named locations"
+            )
+
+        except Exception as exc:
+
+            errors.append(
+                f"{endpoint}: wider search failed - {str(exc)}"
+            )
+
+    # -----------------------------------------------------
+    # Everything failed
+    # -----------------------------------------------------
+
+    error_summary = "\n".join(
+        f"• {error}"
+        for error in errors[-8:]
+    )
+
+    raise RuntimeError(
+        "NOMIA could not retrieve OpenStreetMap locations "
+        "from the available Overpass servers.\n\n"
+        f"{error_summary}"
+    )
 
 
 # =========================================================
@@ -492,7 +711,10 @@ def directions_url(name, lat, lon):
 # CURRENT CITY
 # =========================================================
 
-city = st.session_state.get("city", "Delhi")
+city = st.session_state.get(
+    "city",
+    "Delhi",
+)
 
 city_info = get_city(city)
 
@@ -505,11 +727,17 @@ if not city_info:
     st.stop()
 
 
-country = city_info.get("country", "India")
+country = city_info.get(
+    "country",
+    "India",
+)
 
 st.session_state["country"] = country
 
-coordinates = city_info.get("coordinates", {})
+coordinates = city_info.get(
+    "coordinates",
+    {},
+)
 
 city_lat = coordinates.get("lat")
 city_lon = coordinates.get("lon")
@@ -527,51 +755,94 @@ if city_lat is None or city_lon is None:
 # HEADER
 # =========================================================
 
-st.html(f"""
-<div style="
-    padding:30px 0 20px 0;
-    margin-top:10px;">
-
+st.html(
+    f"""
     <div style="
-        color:#60a5fa;
-        font-size:12px;
-        font-weight:700;
-        letter-spacing:.16em;">
-        CITY ESSENTIALS
+        padding:30px 0 20px 0;
+        margin-top:10px;
+    ">
+
+        <div style="
+            color:#60a5fa;
+            font-size:12px;
+            font-weight:700;
+            letter-spacing:.16em;
+        ">
+            CITY ESSENTIALS
+        </div>
+
+        <h1 style="
+            font-size:48px;
+            margin:10px 0 0 0;
+            font-weight:750;
+            color:#f5f7fa;
+        ">
+            Be ready for {city}.
+        </h1>
+
+        <p style="
+            color:#8f9aaa;
+            font-size:16px;
+            margin-top:10px;
+        ">
+            Real essential locations around your city.
+        </p>
+
     </div>
-
-    <h1 style="
-        font-size:48px;
-        margin:10px 0 0 0;
-        font-weight:750;
-        color:#f5f7fa;">
-        Be ready for {city}.
-    </h1>
-
-    <p style="
-        color:#8f9aaa;
-        font-size:16px;
-        margin-top:10px;">
-        Real essential locations around your city.
-    </p>
-
-</div>
-""")
+    """
+)
 
 
 # =========================================================
 # LOAD OSM DATA
 # =========================================================
 
+locations = None
+fetch_error = None
+
 with st.spinner(
     f"Finding essential locations around {city}..."
 ):
 
-    locations = fetch_essential_locations(
-        city,
-        city_lat,
-        city_lon,
+    try:
+
+        locations = fetch_essential_locations(
+            city,
+            city_lat,
+            city_lon,
+        )
+
+    except Exception as exc:
+
+        fetch_error = str(exc)
+
+        locations = {
+            category: []
+            for category in CATEGORIES
+        }
+
+
+# =========================================================
+# API ERROR STATE
+# =========================================================
+
+if fetch_error:
+
+    st.error(
+        "NOMIA could not load live OpenStreetMap locations right now."
     )
+
+    st.caption(
+        "The page itself is working. The external map-data "
+        "service did not return usable results."
+    )
+
+    with st.expander("Technical details"):
+
+        st.code(
+            fetch_error,
+            language="text",
+        )
 
 
 # =========================================================
@@ -601,19 +872,25 @@ tips = LOCAL_TIPS.get(
 
 c1, c2, c3 = st.columns(3)
 
+
 with c1:
+
     st.metric(
         "Locations found",
         total_locations,
     )
 
+
 with c2:
+
     st.metric(
         "Categories",
         categories_found,
     )
 
+
 with c3:
+
     st.metric(
         "City",
         city,
@@ -627,19 +904,22 @@ st.divider()
 # ESSENTIAL LOCATIONS
 # =========================================================
 
-st.html("""
-<h2 style="margin-bottom:8px;">
-    🧭 What you may need
-</h2>
+st.html(
+    """
+    <h2 style="margin-bottom:8px;">
+        🧭 What you may need
+    </h2>
 
-<p style="
-    color:#8f9aaa;
-    font-size:14px;
-    margin-top:0;
-    margin-bottom:22px;">
-    Real places discovered from OpenStreetMap around your city centre.
-</p>
-""")
+    <p style="
+        color:#8f9aaa;
+        font-size:14px;
+        margin-top:0;
+        margin-bottom:22px;
+    ">
+        Real places discovered from OpenStreetMap around your city centre.
+    </p>
+    """
+)
 
 
 # =========================================================
@@ -660,44 +940,51 @@ for category, config in CATEGORIES.items():
     # CATEGORY HEADER
     # -----------------------------------------------------
 
-    st.html(f"""
-    <div style="
-        margin-top:24px;
-        margin-bottom:16px;">
-
+    st.html(
+        f"""
         <div style="
-            display:flex;
-            align-items:center;
-            gap:10px;">
+            margin-top:24px;
+            margin-bottom:16px;
+        ">
 
-            <span style="font-size:22px;">
-                {icon}
-            </span>
+            <div style="
+                display:flex;
+                align-items:center;
+                gap:10px;
+            ">
 
-            <span style="
-                color:#f5f7fa;
-                font-size:22px;
-                font-weight:700;">
-                {category}
-            </span>
+                <span style="font-size:22px;">
+                    {icon}
+                </span>
 
-            <span style="
+                <span style="
+                    color:#f5f7fa;
+                    font-size:22px;
+                    font-weight:700;
+                ">
+                    {category}
+                </span>
+
+                <span style="
+                    color:#71849d;
+                    font-size:13px;
+                ">
+                    {len(category_locations)} found
+                </span>
+
+            </div>
+
+            <div style="
                 color:#71849d;
-                font-size:13px;">
-                {len(category_locations)} found
-            </span>
+                font-size:13px;
+                margin-top:5px;
+            ">
+                {description}
+            </div>
 
         </div>
-
-        <div style="
-            color:#71849d;
-            font-size:13px;
-            margin-top:5px;">
-            {description}
-        </div>
-
-    </div>
-    """)
+        """
+    )
 
 
     # -----------------------------------------------------
@@ -708,7 +995,9 @@ for category, config in CATEGORIES.items():
 
         cols = st.columns(2)
 
-        for i, place in enumerate(category_locations):
+        for i, place in enumerate(
+            category_locations
+        ):
 
             with cols[i % 2]:
 
@@ -717,33 +1006,38 @@ for category, config in CATEGORIES.items():
                 lat = place["lat"]
                 lon = place["lon"]
 
-                st.html(f"""
-                <div style="
-                    border:1px solid #202630;
-                    border-radius:16px;
-                    padding:20px;
-                    min-height:145px;
-                    margin-bottom:14px;
-                    background:rgba(10,14,20,0.45);">
-
+                st.html(
+                    f"""
                     <div style="
-                        color:#f5f7fa;
-                        font-size:18px;
-                        font-weight:700;
-                        line-height:1.35;">
-                        {name}
-                    </div>
+                        border:1px solid #202630;
+                        border-radius:16px;
+                        padding:20px;
+                        min-height:145px;
+                        margin-bottom:14px;
+                        background:rgba(10,14,20,0.45);
+                    ">
 
-                    <div style="
-                        color:#91a4bd;
-                        font-size:13px;
-                        line-height:1.5;
-                        margin-top:10px;">
-                        📍 {address}
-                    </div>
+                        <div style="
+                            color:#f5f7fa;
+                            font-size:18px;
+                            font-weight:700;
+                            line-height:1.35;
+                        ">
+                            {name}
+                        </div>
 
-                </div>
-                """)
+                        <div style="
+                            color:#91a4bd;
+                            font-size:13px;
+                            line-height:1.5;
+                            margin-top:10px;
+                        ">
+                            📍 {address}
+                        </div>
+
+                    </div>
+                    """
+                )
 
                 st.link_button(
                     "Directions ↗",
@@ -757,21 +1051,37 @@ for category, config in CATEGORIES.items():
 
     else:
 
-        st.html(f"""
-        <div style="
-            border:1px solid #202630;
-            border-radius:14px;
-            padding:16px 18px;
-            margin-bottom:18px;
-            color:#71849d;
-            font-size:13px;
-            background:rgba(10,14,20,0.25);">
+        if fetch_error:
 
-            No named {category.lower()} locations were returned
-            by OpenStreetMap around the selected city centre.
+            empty_message = (
+                "Live location data could not be loaded "
+                "from OpenStreetMap right now."
+            )
 
-        </div>
-        """)
+        else:
+
+            empty_message = (
+                f"No named {category.lower()} locations were "
+                "returned by OpenStreetMap around the selected city."
+            )
+
+        st.html(
+            f"""
+            <div style="
+                border:1px solid #202630;
+                border-radius:14px;
+                padding:16px 18px;
+                margin-bottom:18px;
+                color:#71849d;
+                font-size:13px;
+                background:rgba(10,14,20,0.25);
+            ">
+
+                {empty_message}
+
+            </div>
+            """
+        )
 
 
 st.divider()
@@ -781,14 +1091,17 @@ st.divider()
 # NOMIA LOCAL KNOWLEDGE
 # =========================================================
 
-st.html("""
-<h2 style="margin-bottom:18px;">
-    💡 NOMIA local knowledge
-</h2>
-""")
+st.html(
+    """
+    <h2 style="margin-bottom:18px;">
+        💡 NOMIA local knowledge
+    </h2>
+    """
+)
 
 
 for tip in tips:
+
     st.info(tip)
 
 
@@ -796,45 +1109,54 @@ for tip in tips:
 # DATA SOURCE NOTE
 # =========================================================
 
-st.html("""
-<div style="
-    margin-top:28px;
-    padding:16px 18px;
-    border:1px solid rgba(96,165,250,.15);
-    border-radius:12px;
-    background:rgba(96,165,250,.04);
-    color:#71849d;
-    font-size:12px;
-    line-height:1.6;">
+st.html(
+    """
+    <div style="
+        margin-top:28px;
+        padding:16px 18px;
+        border:1px solid rgba(96,165,250,.15);
+        border-radius:12px;
+        background:rgba(96,165,250,.04);
+        color:#71849d;
+        font-size:12px;
+        line-height:1.6;
+    ">
 
-    <strong style="color:#91a4bd;">
-        Location data
-    </strong><br>
+        <strong style="color:#91a4bd;">
+            Location data
+        </strong><br>
 
-    Essential places are discovered from OpenStreetMap.
-    Availability, opening hours and business details can change,
-    so verify important information before travelling.
+        Essential places are discovered from OpenStreetMap.
+        NOMIA automatically uses available Overpass servers
+        and caches successful results for 24 hours.
 
-</div>
-""")
+        Availability, opening hours and business details can change,
+        so verify important information before travelling.
+
+    </div>
+    """
+)
 
 
 # =========================================================
 # FOOTER
 # =========================================================
 
-st.html("""
-<div style="
-    margin-top:20px;
-    padding:18px;
-    border:1px solid #202630;
-    border-radius:14px;
-    color:#71849d;
-    font-size:13px;">
+st.html(
+    """
+    <div style="
+        margin-top:20px;
+        padding:18px;
+        border:1px solid #202630;
+        border-radius:14px;
+        color:#71849d;
+        font-size:13px;
+    ">
 
-    NOMIA provides a starting layer for local discovery.
-    Always verify current opening hours, transport schedules
-    and service availability before travelling.
+        NOMIA provides a starting layer for local discovery.
+        Always verify current opening hours, transport schedules
+        and service availability before travelling.
 
-</div>
-""")
+    </div>
+    """
+)
